@@ -1,74 +1,147 @@
-/**
- *******************************************************************************
- * @file      : comm_task.cpp
- * @brief     : 通讯任务实现——新人填写
- * @history   :
- *  Version     Date            Author          Note
- *  V1.0.0      2026-10-02      Hello World     1. 考核骨架：掏空通讯分发与接线，
- *                                                 CAN 底层也由新人自己实现
- *******************************************************************************
- *  Copyright (c) 2024 Hello World Team, Zhejiang University.
- *  All Rights Reserved.
- *******************************************************************************
- */
-/* Includes ------------------------------------------------------------------*/
 #include "comm_task.hpp"
+#include "diagnostics.hpp"
+#include "irq_guard.hpp"
+#include "rc_ins.hpp"
+#include "can.h"
+#include "usart.h"
 
-/* Private macro -------------------------------------------------------------*/
-/* Private constants ---------------------------------------------------------*/
-/* Private types -------------------------------------------------------------*/
-/* Private variables ---------------------------------------------------------*/
-/* Exported function definitions ---------------------------------------------*/
-void CommTaskInit()
-{
-  /* TODO【新人任务】:
-   * 通讯层一次性初始化（**骨架不提供 CAN 组件，CAN 底层要自己写**）：
-   *   1. CPU 串口（DBUS）接收接线：对 rc_uart_ptr（&huart1，见 Dart-Configs/
-   *      basic_configs.hpp）调用 HAL_UARTEx_ReceiveToIdle_DMA，缓冲区长度 18。
-   *   2. CAN1 底层初始化（自己实现，可直接用 HAL）：
-   *        配置滤波器（全收）→ HAL_CAN_ConfigFilter(&hcan1, ...) →
-   *        HAL_CAN_Start(&hcan1) →
-   *        HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING)。
-   *   3. 独立看门狗 IWDG 已在 CubeMX 中初始化（MX_IWDG_Init），无需重复初始化。
-   *
-   * 提示：可以新建自己的目录（如 Comm/）放 CAN / 电机协议代码；新目录记得加入
-   *       CMakeLists.txt 的 set(user_folders ...)。
-   */
+namespace {
+// Larger than one DBUS frame: reject oversize bursts instead of accepting the
+// first 18 bytes on DMA transfer complete. IDLE is the frame delimiter.
+alignas(4) uint8_t rx_buffer[36];
+diagnostic::IdleFraming framing;
+diagnostic::CommSnapshot counters;
+diagnostic::MotorFeedback motors[] = {
+    {3591.0f / 187.0f, 1, true},
+    {3591.0f / 187.0f, -1, true},
+    {36.0f, -1, false}};
+bool initialized = false, dma_ready = false, recovery_pending = false;
+
+bool armReceiver() {
+  if (!dma_ready || huart1.RxState != HAL_UART_STATE_READY) return false;
+  const auto result = HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_buffer, sizeof(rx_buffer));
+  if (result != HAL_OK) { ++counters.uart_arm_failures; return false; }
+  __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+  counters.uart_armed = true;
+  if (recovery_pending) { ++counters.uart_recoveries; recovery_pending = false; }
+  return true;
+}
 }
 
-void CommTask()
-{
-  /* TODO【新人任务】:
-   * 每个通讯周期（2ms，与 MainTask 一起由 TIM3 调用）执行：
-   *   1. 把你自己的电机协议 encode 出的 8 字节填入 0x200 共享帧并发送
-   *      （同步带左/右、丝杆同属 0x200，每台占 2 字节，注意先 encode 后一起发；
-   *      发送可直接 HAL_CAN_AddTxMessage，或封装成自己的发送函数）。
-   *   2. 其他需要周期下发的通讯（本骨架无）。
-   *
-   * !!! 安全红线 !!!
-   *   - 这里发送的只能是控制逻辑按遥控器指令生成的目标值；
-   *     不得无条件发送常值/递增输入让 M3508 / M2006 持续转动。
-   *   - 遥控器离线 / 安全档时，控制逻辑应把目标清零后再发送。
-   */
+void CommTaskInit() {
+  if (initialized) return;
+  initialized = true;
+  // Equal RX priorities prevent UART and its DMA callback from reentering
+  // one another. TIM3 runs at the existing lower priority (2).
+  HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 1, 0);
+  HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 1, 0);
+
+  if (!huart1.hdmarx || HAL_DMA_DeInit(huart1.hdmarx) != HAL_OK) {
+    counters.init_errors |= 1U;
+  } else {
+    // Override the generated circular mode at runtime; leave CubeMX files intact.
+    huart1.hdmarx->Init.Mode = DMA_NORMAL;
+    dma_ready = HAL_DMA_Init(huart1.hdmarx) == HAL_OK;
+    if (!dma_ready) counters.init_errors |= 1U;
+  }
+  if (!armReceiver()) counters.init_errors |= 2U;
+
+  CAN_FilterTypeDef filter{};
+  filter.FilterBank = 0;
+  filter.FilterMode = CAN_FILTERMODE_IDLIST;
+  filter.FilterScale = CAN_FILTERSCALE_16BIT;
+  // Four standard DATA identifiers in list mode (IDE/RTR bits remain zero).
+  filter.FilterIdHigh = 0x201U << 5;
+  filter.FilterIdLow = 0x202U << 5;
+  filter.FilterMaskIdHigh = 0x203U << 5;
+  filter.FilterMaskIdLow = 0x201U << 5;
+  filter.FilterFIFOAssignment = CAN_RX_FIFO0;
+  filter.FilterActivation = ENABLE;
+  filter.SlaveStartFilterBank = 14;
+  if (HAL_CAN_ConfigFilter(&hcan1, &filter) != HAL_OK) {
+    counters.init_errors |= 4U;
+    return;
+  }
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+    counters.init_errors |= 8U;
+    return;
+  }
+  counters.can_started = true;
+  if (HAL_CAN_ActivateNotification(&hcan1,
+      CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_RX_FIFO0_OVERRUN) != HAL_OK) {
+    counters.init_errors |= 16U;
+  }
 }
 
-/* Private function definitions ----------------------------------------------*/
-/* TODO【新人任务】:
- * 实现以下两个中断回调（都需要自己写，建议放在本文件）：
- *
- * 1) CAN 接收：HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
- *    - hcan == &hcan1 时取一帧（HAL_CAN_GetRxMessage），按 StdId 分发：
- *      0x201/0x202/0x203 → 调用你自己的电机反馈解析函数；
- *    - 处理完重新使能接收中断（HAL_CAN_ActivateNotification）。
- *
- * 2) UART 空闲接收：HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t Size)
- *    - huart == rc_uart_ptr 时收满 18 字节 → CreateRc()->decode(rx_buf)；
- *    - 刷新 IWDG：HAL_IWDG_Refresh(&hiwdg)（含 "iwdg.h"）；
- *    - 重新启动下一轮空闲 + DMA 接收。
- *
- * 注意：
- *   - HAL 回调是 C 链接（包含 "usart.h" / "can.h" 即可获得正确链接），
- *     不要写在 class 内；
- *   - 安全：若遥控器数据长时间未更新（离线），必须让控制逻辑把电机输出归零，
- *     不得在失联状态下继续驱动 M3508 / M2006。
- */
+void CommTask() {
+  diagnostic::IrqGuard guard;
+  if (!counters.uart_armed) armReceiver();
+  counters.can_esr = hcan1.Instance->ESR;
+  counters.bus_off = (counters.can_esr & CAN_ESR_BOFF) != 0;
+  // Intentionally no HAL_CAN_AddTxMessage, servo initialization, or PWM start.
+}
+
+namespace diagnostic {
+void CopyCommSnapshot(CommSnapshot& destination, uint32_t now) {
+  IrqGuard guard;
+  destination = counters;
+  destination.rc = CreateRcMonitor()->sample(now);
+  for (unsigned i = 0; i < 3; ++i) destination.motors[i] = motors[i].sample(now);
+}
+}
+
+extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* uart, uint16_t size) {
+  if (uart != &huart1) return;
+  const auto event = HAL_UARTEx_GetRxEventType(uart);
+  if (event == HAL_UART_RXEVENT_HT) return;
+  counters.uart_armed = false;
+  ++counters.uart_events; counters.uart_last_size = size;
+  if (framing.accept(size, event == HAL_UART_RXEVENT_IDLE)) {
+    CreateRcMonitor()->accept(rx_buffer, size, HAL_GetTick());
+  } else {
+    CreateRcMonitor()->reject();
+  }
+  armReceiver();
+}
+
+extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* uart) {
+  if (uart != &huart1) return;
+  ++counters.uart_errors; counters.uart_last_error = uart->ErrorCode;
+  counters.uart_armed = false; recovery_pending = true;
+  CreateRcMonitor()->reject(); framing.loseSync();
+  // Abort asynchronously; retry only once HAL returns to READY. Never spin in ISR.
+  HAL_UART_AbortReceive_IT(uart);
+}
+
+extern "C" void HAL_UART_AbortReceiveCpltCallback(UART_HandleTypeDef* uart) {
+  if (uart == &huart1) counters.uart_armed = false;
+}
+
+extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* can) {
+  if (can != &hcan1) return;
+  // Hardware FIFO depth is three. Bound each IRQ even under sustained traffic.
+  for (unsigned n = 0; n < 3 && HAL_CAN_GetRxFifoFillLevel(can, CAN_RX_FIFO0); ++n) {
+    CAN_RxHeaderTypeDef header{};
+    uint8_t data[8]{};
+    if (HAL_CAN_GetRxMessage(can, CAN_RX_FIFO0, &header, data) != HAL_OK) {
+      ++counters.can_read_errors;
+      break;
+    }
+    ++counters.can_frames;
+    if (header.IDE != CAN_ID_STD || header.RTR != CAN_RTR_DATA ||
+        header.StdId < 0x201 || header.StdId > 0x203) {
+      ++counters.can_rejected;
+      continue;
+    }
+    if (!motors[header.StdId - 0x201].accept(data, header.DLC, HAL_GetTick()))
+      ++counters.can_rejected;
+  }
+  // HAL leaves FIFO0 MSG_PENDING enabled; it is not a one-shot notification.
+}
+
+extern "C" void HAL_CAN_ErrorCallback(CAN_HandleTypeDef* can) {
+  if (can != &hcan1) return;
+  ++counters.can_error_events;
+  counters.can_last_error = HAL_CAN_GetError(can);
+}

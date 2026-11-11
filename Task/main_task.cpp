@@ -1,65 +1,82 @@
-/**
- *******************************************************************************
- * @file      : main_task.cpp
- * @brief     : 主任务实现——新人填写
- * @history   :
- *  Version     Date            Author          Note
- *  V1.0.0      2026-10-02      Hello World     1. 考核骨架：掏空主任务与周期调度
- *******************************************************************************
- *  Copyright (c) 2024 Hello World Team, Zhejiang University.
- *  All Rights Reserved.
- *******************************************************************************
- */
-/* Includes ------------------------------------------------------------------*/
 #include "main_task.hpp"
+#include "comm_task.hpp"
+#include "diagnostics.hpp"
+#include "irq_guard.hpp"
+#include "tim.h"
+#include "iwdg.h"
 
-/* Private macro -------------------------------------------------------------*/
-/* Private constants ---------------------------------------------------------*/
-/* Private types -------------------------------------------------------------*/
-/* Private variables ---------------------------------------------------------*/
-/* External variables --------------------------------------------------------*/
-/* Private function prototypes -----------------------------------------------*/
-/* Exported function definitions ---------------------------------------------*/
-void MainTaskInit()
-{
-  /* TODO【新人任务】:
-   * 一次性初始化（由 main() 在 while(1) 之前调用一次）：
-   *   1. 通过 Instance 层拿到执行器 / 遥控器 / 各模块 / 顶层状态机对象
-   *      （CreateMotorBeltLhs() / CreateServoShoot() / CreateRc() / CreateMainFsm() ...）。
-   *   2. 完成注册与初始化：把传感器与执行器注册进各模块，把模块注册进 MainFsm。
-   *   3. 调用 CommTaskInit() 完成通讯初始化（CAN filter、UART 接收、IWDG 等）。
-   *   4. 启动 500Hz 控制定时器：HAL_TIM_Base_Start_IT(&htim3)。
-   * 注意：不要在这里写任何周期性逻辑，也不要死等延时。
-   *
-   * !!! 安全红线 !!!
-   *   - 上电初始化完成后**不要自动驱动任何电机转动**：必须等收到有效遥控器
-   *     数据、且处于对应操作档位后，才允许按遥控器指令输出。
-   *   - **禁止让 M3508 / M2006 电机持续转动**；不允许写「上电就让同步带/丝杆
-   *     转起来测试」之类的代码。
-   */
+namespace diagnostic {
+Snapshot g_diagnostics;
+volatile uint32_t g_diagnostic_sequence = 0;
+void CopyDiagnosticSnapshot(Snapshot& destination) {
+  IrqGuard guard;
+  destination = g_diagnostics;
+}
 }
 
-void MainTask()
-{
-  /* TODO【新人任务】:
-   * 2ms 控制周期入口：调用顶层状态机的 update() → genCmd() → run()，
-   * 由状态机完成「读数据 → 迁移 → 生成指令 → 下发」的整条链路。
-   * 保持薄薄一层，不要在这里堆业务逻辑。
-   *
-   * !!! 安全红线 !!!
-   *   - **禁止让 M3508 / M2006 持续转动**；所有动作必须由遥控器指令驱动；
-   *   - 遥控器离线 / 安全档 / 未进入 Working 时，电机输出必须为 0
-   *     （setInput(0)），不得让电机保持转动。
-   */
+namespace {
+diagnostic::Snapshot snapshot;
+diagnostic::WatchdogGate watchdog_gate;
+bool initialized = false;
+uint32_t last_tick = 0;
+
+void publish() {
+  diagnostic::IrqGuard guard;
+  diagnostic::g_diagnostic_sequence = diagnostic::g_diagnostic_sequence + 1;
+  diagnostic::g_diagnostics = snapshot;
+  diagnostic::g_diagnostic_sequence = diagnostic::g_diagnostic_sequence + 1;
+}
 }
 
-/* Private function definitions ----------------------------------------------*/
-/* TODO【新人任务】:
- * 实现 TIM3 周期中断回调 HAL_TIM_PeriodElapsedCallback：
- *   - 先判中断来自 &htim3（避免把别的定时器中断误当成控制周期）；
- *   - 再调用 MainTask() 与 CommTask()。
- * 注意：
- *   - main.c 已配置 TIM3；请在 MainTaskInit() 中 HAL_TIM_Base_Start_IT(&htim3)；
- *   - HAL 回调是 C 链接，包含 HAL 头文件（如 "tim.h"）即可获得正确链接；
- *     若自己声明，需用 extern "C" 包裹。
- */
+void MainTaskInit() {
+  if (initialized) return;
+  initialized = true;
+  snapshot.reset_flags = RCC->CSR;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  CommTaskInit();
+  {
+    diagnostic::IrqGuard guard;
+    __HAL_TIM_SET_COUNTER(&htim3, 0);
+    __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
+    snapshot.timer_started = HAL_TIM_Base_Start_IT(&htim3) == HAL_OK;
+    diagnostic::CopyCommSnapshot(snapshot.comm, HAL_GetTick());
+    publish();
+  }
+}
+
+void MainTask() {
+  const uint32_t now = HAL_GetTick();
+  if (snapshot.ticks != 0) {
+    snapshot.last_period_ms = now - last_tick;
+    if (snapshot.last_period_ms > snapshot.max_period_ms)
+      snapshot.max_period_ms = snapshot.last_period_ms;
+    if (snapshot.last_period_ms > 3) ++snapshot.delayed_periods;
+  }
+  last_tick = now; snapshot.now_ms = now; ++snapshot.ticks;
+  diagnostic::CopyCommSnapshot(snapshot.comm, now);
+  snapshot.health = diagnostic::classify(snapshot.comm.rc, snapshot.comm.motors);
+  if (snapshot.comm.bus_off && snapshot.health == diagnostic::Health::Online)
+    snapshot.health = diagnostic::Health::Degraded;
+  // Only the periodic task feeds IWDG, and only after new valid input.
+  // CAN devices need not be present to run remote-only diagnostics.
+  if (watchdog_gate.shouldRefresh(snapshot.comm.rc,
+      snapshot.timer_started && snapshot.comm.init_errors == 0)) {
+    if (HAL_IWDG_Refresh(&hiwdg) == HAL_OK) ++snapshot.watchdog_refreshes;
+    else ++snapshot.watchdog_errors;
+  }
+}
+
+extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* timer) {
+  if (timer != &htim3) return;
+  const uint32_t start = DWT->CYCCNT;
+  CommTask();
+  MainTask();
+  publish();
+  const uint32_t elapsed = DWT->CYCCNT - start;
+  if (elapsed > snapshot.max_handler_cycles) snapshot.max_handler_cycles = elapsed;
+  if (elapsed >= SystemCoreClock / 500U) ++snapshot.handler_overruns;
+  // Timing counters include publication and appear in the following snapshot.
+}
