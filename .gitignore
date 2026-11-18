@@ -1,0 +1,7 @@
+#不需要提交的目录
+/build/
+#不需要提交的文件
+*.jdebug.user
+/1.jdebug
+/2.jdebug
+__pycache__/
