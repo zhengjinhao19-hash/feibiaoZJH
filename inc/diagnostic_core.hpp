@@ -10,6 +10,14 @@ constexpr uint32_t kRcTimeoutMs = 100;
 constexpr uint32_t kMotorTimeoutMs = 50;
 constexpr float kPi = 3.14159265358979323846f;
 
+// Latched module fault codes: diagnostics only, do not change control policy.
+enum class ModuleFault : uint8_t {
+  None=0, FeedbackMissing=1, FeedbackOffline=2, ReferenceLost=3,
+  Skew=4, Travel=5, HomingDisabled=6, HomingTimeout=7,
+  HomingReverse=8, HomingTravel=9, MoveTimeout=10,
+  NotHomed=11, Stall=12, Overspeed=13, ReliefTimeout=14,
+};
+
 class Freshness {
  public:
   void update(uint32_t now) { last_ = now; seen_ = true; valid_ = true; }
@@ -30,6 +38,24 @@ struct RemoteSample {
   bool seen = false, valid = false, online = false;
   float lh = 0, lv = 0, rh = 0, rv = 0, wheel = 0;
   uint8_t left_switch = 0, right_switch = 0;
+};
+
+enum class StopReason : uint8_t {
+  None=0, TriggerReleased=1, StepTimeout=2, BeltFault=3, ScrewFault=4,
+  ServoUnavailable=5, CommInit=6, CanBusOff=7, CanTxStalled=8,
+  CanError=9, CanTxError=10, ActiveModeSwitch=11, RemoteOffline=12,
+  ExternalStop=13, SafetyRelease=14, ReliefUnavailable=15,
+};
+// Normalized coordinates/commands: lhs first, rhs second; retained before zeroing.
+struct BeltFaultSample {
+  float position_rad[2]{}, velocity_rad_s[2]{};
+  int16_t input[2]{}, measured_current_raw[2]{};
+};
+struct StopRecord {
+  StopReason reason = StopReason::None;
+  uint8_t mode = 0, step = 0;
+  uint32_t tick_ms = 0, step_elapsed_ms = 0, sequence = 0;
+  RemoteSample remote;
 };
 
 class RemoteMonitor {
@@ -68,6 +94,7 @@ struct MotorSample {
   bool temperature_available = false;
   int64_t relative_counts = 0;
   float relative_output_rad = 0, output_rad_s = 0;
+  float output_current_amp = 0;  // Physical direction, supplied by Motor::sample.
 };
 
 class MotorFeedback {

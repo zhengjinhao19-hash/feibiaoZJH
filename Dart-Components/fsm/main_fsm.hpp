@@ -1,16 +1,20 @@
 /**
  *******************************************************************************
  * @file      : main_fsm.hpp
- * @brief     : 顶层状态机（单发模式）——新人填写
+ * @brief     : 顶层状态机（Standby / OneShoot / Manual）
  * @history   :
  *  Version     Date            Author          Note
  *  V1.0.0      2026-10-02      Hello World     1. 考核骨架：掏空单发工作逻辑
+ *  V1.1.0      2026-11-12      Hello World     2. 实现工作模式、单发步骤、
+ *                                                 超时兜底与安全归零
  *******************************************************************************
  * @attention :
- *  本文件已掏空。新人需自行设计并声明顶层状态机类（建议 namespace dart，类名
- *  MainFsm，继承已提供的 dart::Fsm），负责单发模式的工作逻辑。
- *  生命状态机（Dead/Resurrection/Working）由 Dart-Components/fsm/fsm.hpp 提供，
- *  不需要自己实现。
+ *  1. 本类只处理 Working 态下的业务；Dead / Resurrection 由 dart::Fsm 基类
+ *     负责，期间所有执行器强制归零 / 舵机复位。
+ *  2. 安全门控优先级最高：遥控离线、拨回安全档、模块故障、未进入 Working
+ *     都会立即停止所有动作，而不是等当前步骤走完。
+ *  3. 顶层不直接刷新 IWDG：Task/main_task.cpp 只在一帧新的有效遥控数据被
+ *     消费后刷新，防止"遥控失联但中断仍在喂狗"。
  *******************************************************************************
  *  Copyright (c) 2024 Hello World Team, Zhejiang University.
  *  All Rights Reserved.
@@ -21,57 +25,123 @@
 #define DART_COMPONENTS_MAIN_FSM_HPP_
 
 /* Includes ------------------------------------------------------------------*/
+#include <cstdint>
+
+#include "belt_fsm.hpp"
+#include "diagnostic_core.hpp"
 #include "fsm.hpp"
-/* Exported macro ------------------------------------------------------------*/
-/* Exported constants --------------------------------------------------------*/
+#include "screw_fsm.hpp"
+#include "shoot_fsm.hpp"
+
+namespace dart
+{
 /* Exported types ------------------------------------------------------------*/
+
+class MainFsm : public Fsm
+{
+   public:
+    /// 左下右中卸力停机；左下右下自动；左下右上手动；其他档位请求安全待机。
+    enum class Mode : uint8_t {
+        kStandby,   ///< 输出关闭的待机态；安全档请求先执行卸力回程
+        kOneShoot,  ///< 自动：保持内八重复单发，松开后受控卸力
+        kManual,    ///< 左竖轴升降，右竖轴上推扳机，松杆复位
+        kRelief,    ///< 操作者请求的减速卸力回程
+    };
+
+    enum class Step : uint8_t {
+        kReady,     ///< 等待内八（同步带拉起位、舵机复位）
+        kHoming,    ///< 同步带上电复位
+        kPulldown,  ///< 同步带拉下
+        kPullup,    ///< 同步带拉起
+        kShoot,     ///< 舵机击发并保持
+        kFinish,    ///< 舵机复位
+        kFault,     ///< 故障，需拨回安全档后重新进入
+        kManual,    ///< 手动等待/点动，不执行自动单发时序
+        kRelief,    ///< 自动减速、回程卸力
+    };
+
+    enum class ReliefPhase : uint8_t {None, Direct, ToBottom, TriggerHold, ReturnOpen, TriggerReset};
+    bool cycleLoaded() const {return cycle_loaded_;}
+    bool loadedRelief() const {return relief_loaded_;}
+    ReliefPhase reliefPhase() const {return relief_phase_;}
+    uint32_t reliefTriggerCount() const {return relief_trigger_count_;}
+
+    MainFsm() = default;
+
+    /**
+     * @brief 绑定模块与遥控器
+     * @note  由 Instance/fsm_ins.cpp 调用；重复调用只更新指针，不重复复位。
+     */
+    void init(BeltFsm* belt, ScrewFsm* screw, ShootFsm* shoot,
+              diagnostic::RemoteMonitor* rc);
+
+    /// 2 ms 周期入口：读遥控 → 工作模式 / 步骤 → 模块更新
+    void update();
+
+    Mode mode() const { return mode_; }
+    Step step() const { return step_; }
+    bool initialized() const { return initialized_; }
+    bool fault() const { return step_ == Step::kFault; }
+    uint32_t shotCount() const { return shot_count_; }
+    bool remoteOnline() const { return remote_.online; }
+    bool manualWaitingForCenter() const { return manual_wait_center_; }
+    bool manualHoming() const { return manual_homing_; }
+    bool manualTriggerReady() const { return manual_trigger_ready_; }
+    const diagnostic::RemoteSample& remote() const { return remote_; }
+
+    /// 立即归零并回到 Standby（供异常处理 / 调试使用）
+    void stop(diagnostic::StopReason reason = diagnostic::StopReason::ExternalStop);
+    const diagnostic::StopRecord& lastStop() const { return last_stop_; }
+
+   private:
+    void setMode(Mode mode);
+    void resetSequence();
+    void setStep(Step step);
+    void runStepEntry();
+    void updateModules();
+    void safeAll();
+    void updateOneShoot(uint32_t now, const diagnostic::RemoteSample& rc);
+    void updateManual(uint32_t now, const diagnostic::RemoteSample& rc);
+    bool innerEight(const diagnostic::RemoteSample& rc) const;
+    bool stepTimedOut(uint32_t now) const;
+    void abortShot();
+    void beginRelief(diagnostic::StopReason reason);
+    void updateRelief(uint32_t now);
+    void recordStop(diagnostic::StopReason reason);
+    void enterFault(diagnostic::StopReason reason);
+
+    BeltFsm* belt_ = nullptr;
+    ScrewFsm* screw_ = nullptr;
+    ShootFsm* shoot_ = nullptr;
+    diagnostic::RemoteMonitor* rc_ = nullptr;
+
+    bool initialized_ = false;
+    bool was_working_ = false;
+    bool require_safe_switch_ = true;
+    bool manual_wait_center_ = true;
+    bool manual_homing_ = false;
+    bool manual_fire_armed_ = false;
+    bool manual_stationary_active_ = false;
+    bool manual_trigger_ready_ = false;
+    uint32_t manual_stationary_tick_ = 0;
+    Mode mode_ = Mode::kStandby;
+    Step step_ = Step::kReady;
+    bool trigger_armed_ = false;
+    bool auto_repeat_ = false;
+    bool cycle_loaded_=false,relief_loaded_=false;
+    ReliefPhase relief_phase_=ReliefPhase::None;
+    uint32_t relief_trigger_count_=0;
+    bool prev_inner_ = true;
+    uint32_t step_tick_ = 0;
+    uint32_t last_shot_tick_ = 0;
+    uint32_t shot_count_ = 0;
+    diagnostic::RemoteSample remote_{};
+    diagnostic::StopRecord last_stop_{};
+};
+
 /* Exported variables --------------------------------------------------------*/
 /* Exported function prototypes ----------------------------------------------*/
 
-/* ============================================================================
- * 【新人任务】设计顶层状态机类 MainFsm（namespace dart，建议继承 dart::Fsm）。
- *
- * 生命状态机（Dead / Resurrection / Working）已由 Dart-Components/fsm/fsm.hpp
- * 的基类提供：在 update() 中调用 updateWorkState() 即可，**不需要自己写**
- * 生命状态迁移；你只需实现 Working 态下的工作逻辑。
- *
- * !!! 安全红线（硬性验收项，违反直接不通过）!!!
- *   1. **绝对禁止让 M3508 / M2006 电机持续转动**：不允许上电自转、开环常转、
- *      以及任何「没有遥控指令却一直在转」的情况。
- *   2. **所有电机动作必须由遥控器控制**：只有收到有效 DBUS 数据（DT7 已解码）、
- *      且处于对应操作档位 / 触发条件（单发模式 + 内八）时才允许输出；安全档、
- *      遥控器离线或数据失效时，所有电机必须立刻 setInput(0)、舵机回安全角。
- *   3. 不允许为了「测试电机」写无条件循环转动 / 常值电流 / 不受遥控约束的代码。
- *
- * 你要做：
- *   1. 工作模式（至少两种，可自行扩展）：
- *        - Standby（安全模式）：所有电机 setInput(0)，击发舵机回安全角，所有内部
- *          变量复位。遥控器拨到该位即急停（硬性验收项）。
- *        - OneShoot（单发测试模式）：遥控器左拨杆下 + 右拨杆下进入；内八
- *          （rc_lh > 0.8 && rc_lv < -0.8 && rc_rh < -0.8 && rc_rv < -0.8）
- *          触发一次完整发射流程；松开后可再次内八发射下一发。
- *   2. 单发工作步骤（建议）：
- *        Ready  → 等待触发（同步带在拉起位、舵机复位）
- *        Pulldown → 同步带拉下到拉下位（等待 Belt 模块到位）
- *        Pullup   → 同步带拉起（等待 Belt 模块到位）
- *        Shoot    → 击发舵机下拉（保持约 1s）
- *        Finish   → 舵机复位，回到 Ready，可再次触发
- *      触发需做「边沿/保持」处理，避免按着内八连发。
- *   3. 每个控制周期（2ms）：读数据 → updateWorkState()（已提供）→ 更新工作模式
- *      / 工作步骤 → 生成各模块指令 → 调用模块 update/genCmd/run → 刷新 IWDG
- *      （HAL_IWDG_Refresh(&hiwdg)）。
- *   4. 对外提供注册接口，持有遥控器、同步带 / 丝杆 / 击发模块的指针。
- *   5. 进入 Working 前的 Dead / Resurrection 阶段：可做模块复位等准备动作。
- *
- * 约束 / 提示：
- *   - 控制周期入口由 Task/main_task.cpp 的 TIM3 中断（500Hz）调用，本类自己
- *     不要开中断、不要死等延时（用 GetTickMs / 周期计数做计时）。
- *   - 遥控器数据：inc/DT7.hpp 的 DT7；串口接收由你在 Task/comm_task.cpp 接好。
- *   - **CAN 底层（filter / 发送 / 接收分发）与电机设备类（M3508 / M2006 协议）
- *     也不提供，均由你自己实现**（见 Instance/、Task/ 与各模块 TODO）。
- *   - 模块对象由你在 Dart-Components/modules/ 下自行设计（见各目录 TODO）。
- *   - 发射到位判定、电机/舵机安全动作、离线/堵转保护均为验收关注点。
- *   - 参考：code_control/Dart2025/Dart-Components/fsm/main_fsm.cpp（只看思路）。
- * ==========================================================================*/
+}  // namespace dart
 
 #endif /* DART_COMPONENTS_MAIN_FSM_HPP_ */

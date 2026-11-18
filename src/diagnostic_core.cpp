@@ -50,7 +50,14 @@ bool MotorFeedback::accept(const uint8_t* p, size_t length, uint32_t now) {
     ++state_.rejected_frames; freshness_.invalidate(); return false;
   }
   const uint16_t encoder = be16(p);
-  if (!freshness_.online(now, kMotorTimeoutMs)) {
+  // A feedback gap can lose whole turns long before the 50 ms offline limit.
+  // Discard the position reference if speed * gap permits >= half a rotor turn.
+  const int32_t rpm = signed16(be16(p + 2));
+  const float max_rpm = std::fmax(std::fabs(static_cast<float>(state_.rpm)),
+                                std::fabs(static_cast<float>(rpm)));
+  const bool ambiguous_gap = freshness_.seen() &&
+      max_rpm * static_cast<float>(now - freshness_.last()) >= 30000.0f;
+  if (!freshness_.online(now, kMotorTimeoutMs) || ambiguous_gap) {
     state_.continuity_lost = state_.continuity_lost || freshness_.seen();
     ++state_.reference_epoch;
     state_.relative_counts = 0;

@@ -1,16 +1,17 @@
 /**
  *******************************************************************************
  * @file      : motor_ins.hpp
- * @brief     : 电机 / 舵机实例化（新人自己设计）
+ * @brief     : 电机 / 舵机实例化接口
  * @history   :
  *  Version     Date            Author          Note
  *  V1.0.0      2026-10-02      Hello World     1. 考核骨架：不再提供电机类、
- *                                                 CAN 协议与舵机驱动，全部由新人实现
+ *                                                 CAN 协议与舵机驱动
+ *  V1.1.0      2026-11-12      Hello World     2. 提供三台电机、0x200 总线与
+ *                                                 击发舵机的单例工厂
  *******************************************************************************
  * @attention :
- *  本文件已掏空。**骨架不再提供电机设备类（M3508 / M2006）与 CAN 通信组件**
- *  （精简版舵机驱动已随骨架提供：inc/servo.hpp），新人需自己实现电机协议与
- *  实例化，并自行声明 / 修改本文件。
+ *  1. 所有对象使用函数内静态 / 文件内静态方式创建，避免全局构造期访问 HAL。
+ *  2. 电机方向、减速比、反馈 ID 全部来自 Dart-Configs/motor_configs.hpp。
  *******************************************************************************
  *  Copyright (c) 2024 Hello World Team, Zhejiang University.
  *  All Rights Reserved.
@@ -21,31 +22,26 @@
 #define DART_INSTANCE_MOTOR_INS_HPP_
 
 /* Includes ------------------------------------------------------------------*/
-/* Exported macro ------------------------------------------------------------*/
-/* Exported constants --------------------------------------------------------*/
-/* Exported types ------------------------------------------------------------*/
-/* Exported variables --------------------------------------------------------*/
+#include "motor_device.hpp"
+#include "servo.hpp"
+
 /* Exported function prototypes ----------------------------------------------*/
 
-/* ============================================================================
- * 【新人任务】设计电机 / 舵机实例化（可自由修改本文件与 motor_ins.cpp）。
- *
- * 你要做：
- *   1. 自己实现电机设备类（建议放在本目录或 Dart-Components/ 下，自行建文件）：
- *        - M3508（同步带左 id=2 / 右 id=1）：CAN 反馈帧解析（角度、转速、电流、
- *          温度），控制帧打包（int16 电流/原始输入），方向、减速比、单位换算；
- *        - M2006（丝杆 id=3）：同上（协议参数见考核说明 2.1 / 7.2 节与 docs/ 手册）。
- *   2. 击发舵机实例化：使用已提供的精简版舵机驱动（inc/servo.hpp，
- *      ServoInfo + Servo）与 kServoShoot 参数（Dart-Configs/motor_configs.hpp），
- *      接 TIM2 CH3。
- *   3. 提供工厂 / 单例函数，静态定义并配置各执行器，返回给上层的模块使用。
- *
- * !!! 安全红线 !!!
- *   - 电机不得持续转动，所有动作必须由遥控器控制；待机 / 安全档 / 离线时
- *     输出必须为 0。
- *
- * 参考：code_control/Dart2025/HW-Components/devices/（只看协议与换算思路，
- *       注意需去掉 Receiver/Transmitter 耦合）。
- * ==========================================================================*/
+/// 同步带右 M3508（id=1，正向，反馈 0x201）
+dart::Motor* CreateMotorBeltRhs(void);
+/// 同步带左 M3508（id=2，反向，反馈 0x202）
+dart::Motor* CreateMotorBeltLhs(void);
+/// 丝杆 M2006（id=3，反向，反馈 0x203）
+dart::Motor* CreateMotorScrew(void);
+/// 三台电机共用的 0x200 控制帧
+dart::MotorBus* CreateMotorBus(void);
+/// 击发舵机（TIM2 CH3，初始 95°）
+hello_world::servo::Servo* CreateServoShoot(void);
+
+/**
+ * @brief 一次性初始化电机总线与舵机 PWM
+ * @note  必须在 CubeMX 外设初始化（MX_TIM2_Init 等）之后、TIM3 启动之前调用。
+ */
+void InitMotorActuators(void);
 
 #endif /* DART_INSTANCE_MOTOR_INS_HPP_ */

@@ -22,5 +22,6 @@
 /* Exported function prototypes ----------------------------------------------*/
 void CommTaskInit();
 void CommTask();
+void CommTaskTx();
 
 #endif /* DART_TASK_COMM_TASK_HPP_ */

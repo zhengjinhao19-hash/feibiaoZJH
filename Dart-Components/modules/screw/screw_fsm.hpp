@@ -1,14 +1,19 @@
 /**
  *******************************************************************************
  * @file      : screw_fsm.hpp
- * @brief     : 预紧丝杆模块（M2006）——新人填写
+ * @brief     : 预紧丝杆模块（M2006）——位置闭环保持
  * @history   :
  *  Version     Date            Author          Note
  *  V1.0.0      2026-10-02      Hello World     1. 考核骨架：掏空丝杆控制逻辑
+ *  V1.1.0      2026-11-12      Hello World     2. 补齐零点建立、位置保持、
+ *                                                 行程/电流限幅与堵转保护
  *******************************************************************************
  * @attention :
- *  本文件已掏空。新人需自行设计并声明丝杆模块类（建议 namespace dart，类名
- *  ScrewFsm），负责丝杆的位置闭环保持。
+ *  1. angle(rad) = π × height；本模块对外使用"相对使能时刻的高度"，单位
+ *     height（1 height = 2.5 mm 行程），上电不主动寻找限位。
+ *  2. 单发流程中丝杆不改变目标，只做位置保持；任何使能/失能、离线、故障
+ *     都立即 setInput(0)。
+ *  3. 预紧微调只接受小步长 nudge()，目标被限制在 ±kScrewTravelLimit。
  *******************************************************************************
  *  Copyright (c) 2024 Hello World Team, Zhejiang University.
  *  All Rights Reserved.
@@ -19,45 +24,82 @@
 #define DART_COMPONENTS_SCREW_FSM_HPP_
 
 /* Includes ------------------------------------------------------------------*/
-/* Exported macro ------------------------------------------------------------*/
-/* Exported constants --------------------------------------------------------*/
+#include <cstdint>
+
+#include "fsm.hpp"
+#include "motor_device.hpp"
+#include "pid.hpp"
+
+namespace dart
+{
 /* Exported types ------------------------------------------------------------*/
+
+class ScrewFsm : public Fsm
+{
+   public:
+    enum class State : uint8_t {
+        kIdle,
+        kHolding,
+        kFault,
+    };
+
+    ScrewFsm() = delete;
+    explicit ScrewFsm(Motor* motor);
+
+    void init(Motor* motor);
+    void enable();
+    void disable();
+    void update();
+
+    /// 设置相对高度目标（height，1 height = 2.5 mm），自动限幅
+    void setTargetHeight(float height);
+
+    /// 在当前目标上做小步长微调（预紧力加分项）
+    void nudge(float delta_height);
+
+    void clearFault();
+
+    bool initialized() const { return initialized_; }
+    bool holding() const { return state_ == State::kHolding; }
+    bool fault() const { return fault_; }
+    diagnostic::ModuleFault lastFault() const { return last_fault_; }
+    uint32_t lastFaultMs() const { return last_fault_ms_; }
+    State state() const { return state_; }
+
+    float height() const { return height_; }
+    float targetHeight() const { return target_height_; }
+    float velocity() const { return velocity_; }
+
+   private:
+    void zeroOutput();
+    void fail(diagnostic::ModuleFault reason);
+
+    Motor* motor_ = nullptr;
+    learning::Pid pid_;
+
+    State state_ = State::kIdle;
+    bool enabled_ = false;
+    bool initialized_ = false;
+    bool fault_ = false;
+    diagnostic::ModuleFault last_fault_ = diagnostic::ModuleFault::None;
+    uint32_t last_fault_ms_ = 0;
+    bool feedback_initialized_ = false;
+    bool stall_active_ = false;
+
+    uint32_t enable_tick_ = 0;
+    uint32_t stall_tick_ = 0;
+    uint32_t epoch_ = 0;
+
+    float zero_angle_ = 0.0f;
+    float target_height_ = 0.0f;
+    float command_height_ = 0.0f;
+    float height_ = 0.0f;
+    float velocity_ = 0.0f;
+};
+
 /* Exported variables --------------------------------------------------------*/
 /* Exported function prototypes ----------------------------------------------*/
 
-/* ============================================================================
- * 【新人任务】设计预紧丝杆模块类 ScrewFsm（namespace dart）。
- *
- * !!! 安全红线（硬性验收项，违反直接不通过）!!!
- *   - **绝对禁止让 M2006 丝杆电机持续转动**：丝杆行程有限且原车无右侧限位，
- *     持续转动会直接顶坏机构（爆转）。
- *   - 丝杆只能由遥控器指令驱动（加分项的微调），且必须限幅、限速、限幅行程；
- *     单发流程中丝杆保持不动。
- *   - 没有遥控指令时不允许丝杆自行转动；待机 / 安全模式 / 遥控器离线时
- *     setInput(0)；需要保持时用位置闭环做小幅修正，不允许用常值电流一直顶。
- *
- * 硬件：
- *   - 一台 M2006（C610 电调），原始报文输入：
- *       丝杆：id = 3，方向反向，反馈 ID 0x203，与同步带共用发送帧 0x200。
- *   - 高度与电机输出角度换算：angle(rad) = π × height（即 height = angle / π）。
- *
- * 你要做：
- *   1. 位置闭环保持：上电后在安全范围内保持丝杆位置（预紧力高度），防止丝杆
- *      因重力自由下滑；单发流程中不主动改变目标。
- *   2. 安全：待机 / 离线 / 堵转时 setInput(0)；限幅电机输入。
- *   3. 加分项：通过遥控器摇杆微调预紧高度，并把当前高度作为保持目标。
- *
- * 约束 / 提示：
- *   - 生命状态（Dead/Resurrection/Working）已由 Dart-Components/fsm/fsm.hpp 的
- *     dart::Fsm 基类提供：直接继承并在 update() 中调用 updateWorkState()，
- *     不需要自己实现；你只需写 Working 态下的工作逻辑。
- *   - **骨架不提供电机类，也不提供 CAN 通信组件**：电机设备类（反馈帧解析 /
- *     控制帧打包 / 单位换算）与 CAN 底层（filter、发送、接收分发）都由你自己实现。
- *   - 参考：code_control/Dart2025/HW-Components/devices/motor/ 与 bsp/comm/
- *     （只看协议思路，注意去掉 Receiver/Transmitter 耦合）。
- *   - 丝杆行程有限，且原车无右侧限位，任何机动都必须限幅，坚决避免爆转。
- *   - 参考：code_control/Dart2025/Dart-Components/modules/screw/screw_fsm.cpp
- *     （只看思路，原工程还带步进电机自瞄，本骨架已删除）。
- * ==========================================================================*/
+}  // namespace dart
 
 #endif /* DART_COMPONENTS_SCREW_FSM_HPP_ */

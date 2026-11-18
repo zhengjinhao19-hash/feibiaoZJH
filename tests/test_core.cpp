@@ -1,3 +1,4 @@
+#include "motion_profile.hpp"
 #include "diagnostic_core.hpp"
 #include "pid.hpp"
 #include <array>
@@ -96,6 +97,13 @@ int main(int argc, char** argv) {
   check(!motor.accept(p.data(),7,65), "motor DLC validation");
   MotorFeedback small(36,-1,false); small.accept(p.data(),8,0);
   check(!small.sample(0).temperature_available, "reserved temperature not presented as sensor");
+  MotorFeedback fast(19.2f,1,true);
+  p=feedback(0,10000); fast.accept(p.data(),8,100);
+  const auto epoch=fast.sample(100).reference_epoch;
+  p=feedback(100,10000); fast.accept(p.data(),8,104);
+  check(fast.sample(104).online && fast.sample(104).reference_epoch==epoch+1 &&
+        fast.sample(104).continuity_lost,
+        "4 ms high-speed feedback gap invalidates turns before offline timeout");
 
   WatchdogGate gate;
   auto good=rc.sample(30);
@@ -129,6 +137,92 @@ int main(int argc, char** argv) {
   check(near(pid.step(0,std::numeric_limits<float>::infinity(),0.1f),0), "infinity rejected");
   learning::Pid bad({1,0,0,-1,1});
   check(near(bad.step(1,0,0.1f),0), "invalid config rejected");
+
+  // Motion reference: long constant-speed cruise, bounded short stop, both directions.
+  for(float direction : {-1.0f, 1.0f}) {
+    learning::MotionProfile profile;
+    check(profile.reset(0,direction*50,20,80,160),"valid trapezoid configuration");
+    bool bounded=true, monotonic=true;float previous=0;unsigned cruise=0,braking=0;
+    for(int i=0;i<2000 && !profile.finished();++i) {
+      profile.step(0.002f);
+      const float position=direction*profile.position(), speed=std::fabs(profile.speed());
+      bounded=bounded && speed<=20.0001f && position<=50.0001f;
+      monotonic=monotonic && position+1e-5f>=previous;previous=position;
+      if(position>5 && position<48)cruise+=speed>19.99f;
+      if(position>=48.75f && speed<19.99f && speed>0)++braking;
+    }
+    check(profile.finished() && near(profile.position(),direction*50) && profile.speed()==0,
+          "trapezoid reaches exact target in finite time");
+    check(bounded && monotonic && cruise>1000 && braking<=64,
+          "long cruise and at most 128ms braking without overshoot");
+    check(profile.reset(0,direction*0.1f,20,80,160),"short triangular move planned");
+    for(int i=0;i<1000 && !profile.finished();++i)profile.step(0.002f);
+    check(profile.finished() && near(profile.position(),direction*0.1f) && profile.speed()==0,
+          "short triangular move stops exactly");
+  }
+  learning::MotionProfile invalid_profile;
+  check(!invalid_profile.reset(0,1,20,0,160),"invalid acceleration rejected");
+
+  learning::Pid ff_limited({0,1,0,10,1});
+  check(near(ff_limited.step(1,0,0.1f,1),1) && near(ff_limited.integral(),0),
+        "feedforward saturation does not wind up integral");
+  check(near(ff_limited.step(0,0,0.1f,0),0),"removing saturated feedforward leaves no residual integral");
+  check(near(ff_limited.step(0,0,0.1f,std::numeric_limits<float>::quiet_NaN()),0),
+        "invalid feedforward resets controller");
+  for(float direction : {-1.0f,1.0f}) {
+    learning::Pid baseline({5000,300,120,2500,8000}), assisted({5000,300,120,2500,8000});
+    learning::MotionProfile reference;reference.reset(0,direction*50,20,90,160);
+    float p0=0,p1=0,v0=0,v1=0,e0=0,e1=0;unsigned samples=0;bool bounded=true;
+    for(int i=0;i<2000;++i) {
+      reference.step(0.002f);
+      const float ff=50*reference.speed();
+      const float u0=baseline.step(reference.position(),p0,0.002f);
+      const float u1=assisted.step(reference.position(),p1,0.002f,ff);
+      bounded=bounded && std::fabs(u1)<=8000;
+      v0+=0.1f*(0.005f*u0-v0);v1+=0.1f*(0.005f*u1-v1);
+      p0+=v0*0.002f;p1+=v1*0.002f;
+      if(std::fabs(reference.speed())>19.99f && std::fabs(reference.position())>10) {
+        e0+=std::fabs(reference.position()-p0);e1+=std::fabs(reference.position()-p1);++samples;
+      }
+    }
+    check(samples>100 && e1<e0 && bounded,"modest feedforward reduces cruise lag in both directions");
+    check(std::fabs(p1-direction*50)<0.18f,"feedforward vanishes at stop and feedback settles");
+    std::cout<<"Feedforward model cruise error rad: baseline="<<e0/samples
+             <<" assisted="<<e1/samples<<'\n';
+  }
+
+  learning::Pid braking_history({5000,300,120,2500,8000});
+  braking_history.step(0,0,0.002f);
+  braking_history.clearIntegral();
+  check(braking_history.step(0.02f,0.01f,0.002f)<0,
+        "clearing cruise integral preserves measured-velocity braking at endpoint");
+
+  for(float direction : {-1.0f,1.0f}) {
+    learning::MotionProfile approach;
+    check(approach.resetApproach(0,direction*50,35,90,80,5,25.0f/16.8f),"top approach profile planned");
+    float previous=0;bool monotonic=true,bounded=true,slow_zone=true;unsigned slow_samples=0;
+    for(int i=0;i<5000 && !approach.finished();++i) {
+      approach.step(0.002f);
+      const float position=direction*approach.position(),speed=std::fabs(approach.speed());
+      monotonic=monotonic && position+1e-5f>=previous;previous=position;
+      bounded=bounded && position<=50.00001f && speed<=35.00001f;
+      if(50-position<25.0f/16.8f-0.001f) {
+        slow_zone=slow_zone && speed<=5.001f;++slow_samples;
+      }
+    }
+    check(approach.finished() && approach.speed()==0 && near(approach.position(),direction*50),
+          "top approach stops exactly in finite time");
+    check(monotonic && bounded && slow_zone && slow_samples>100,
+          "top approach enters final 25mm below 5rad_s without overshoot");
+    check(approach.resetApproach(0,direction*0.2f,35,90,80,5,25.0f/16.8f),"short approach planned");
+    bool short_bounded=true;
+    for(int i=0;i<1000 && !approach.finished();++i) {
+      approach.step(0.002f);short_bounded=short_bounded && std::fabs(approach.speed())<=5.001f;
+    }
+    check(short_bounded && approach.finished(),"short top approach remains speed capped");
+  }
+  learning::MotionProfile bad_approach;
+  check(!bad_approach.resetApproach(0,1,35,90,80,0,1),"invalid approach speed rejected");
 
   // Dimensionless first-order plant only: dy/dt = -y + u. No hardware mapping.
   std::ofstream csv(argc>1 ? argv[1] : "pid_simulation.csv");
